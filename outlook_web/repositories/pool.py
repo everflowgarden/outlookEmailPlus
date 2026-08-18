@@ -335,6 +335,171 @@ def claim_atomic(
     }
 
 
+def list_accounts_inventory(
+    conn: sqlite3.Connection,
+    *,
+    provider: Optional[str] = None,
+    pool_status: Optional[str] = None,
+    include_tags: Optional[List[str]] = None,
+    exclude_tags: Optional[List[str]] = None,
+    email_domain: Optional[str] = None,
+    limit: int = 100,
+) -> dict:
+    """List pool accounts with optional tag filters for external inventory checks."""
+    safe_limit = max(1, min(int(limit or 100), 500))
+    sql = """
+        SELECT a.id, a.email, a.email_domain, a.provider, a.account_type, a.status,
+               a.pool_status, a.claimed_at, a.lease_expires_at, a.last_claimed_at,
+               a.last_result, a.success_count, a.fail_count, a.updated_at
+        FROM accounts a
+        WHERE a.pool_status IS NOT NULL
+    """
+    params: list = []
+
+    if provider:
+        sql += " AND a.provider = ?"
+        params.append(provider)
+
+    if pool_status:
+        sql += " AND a.pool_status = ?"
+        params.append(pool_status)
+
+    if email_domain:
+        sql += " AND a.email_domain = ? COLLATE NOCASE"
+        params.append(email_domain.strip().lower())
+
+    for tag_name in include_tags or []:
+        sql += """
+            AND EXISTS (
+                SELECT 1 FROM account_tags at_inc
+                JOIN tags t_inc ON t_inc.id = at_inc.tag_id
+                WHERE at_inc.account_id = a.id AND t_inc.name = ?
+            )
+        """
+        params.append(tag_name)
+
+    for tag_name in exclude_tags or []:
+        sql += """
+            AND NOT EXISTS (
+                SELECT 1 FROM account_tags at_exc
+                JOIN tags t_exc ON t_exc.id = at_exc.tag_id
+                WHERE at_exc.account_id = a.id AND t_exc.name = ?
+            )
+        """
+        params.append(tag_name)
+
+    count_sql = f"SELECT COUNT(*) AS total FROM ({sql}) inventory_count"
+    total_row = conn.execute(count_sql, params).fetchone()
+    total = int(total_row["total"] if total_row is not None else 0)
+
+    sql += " ORDER BY a.updated_at DESC, a.id DESC LIMIT ?"
+    rows = conn.execute(sql, [*params, safe_limit]).fetchall()
+    accounts = [dict(row) for row in rows]
+    account_ids = [int(account["id"]) for account in accounts]
+
+    tags_by_account: dict[int, list[dict]] = {}
+    if account_ids:
+        placeholders = ",".join("?" for _ in account_ids)
+        tag_rows = conn.execute(
+            f"""
+            SELECT at.account_id, t.id, t.name, t.color
+            FROM account_tags at
+            JOIN tags t ON t.id = at.tag_id
+            WHERE at.account_id IN ({placeholders})
+            ORDER BY t.name ASC
+            """,
+            account_ids,
+        ).fetchall()
+        for row in tag_rows:
+            tags_by_account.setdefault(int(row["account_id"]), []).append(
+                {
+                    "id": int(row["id"]),
+                    "name": row["name"],
+                    "color": row["color"],
+                }
+            )
+
+    for account in accounts:
+        account["tags"] = tags_by_account.get(int(account["id"]), [])
+
+    return {
+        "accounts": accounts,
+        "total": total,
+        "limit": safe_limit,
+    }
+
+
+def update_account_tags_by_name(
+    conn: sqlite3.Connection,
+    account_id: int,
+    *,
+    add_tags: Optional[List[str]] = None,
+    remove_tags: Optional[List[str]] = None,
+) -> dict:
+    """Add/remove account tags by name, creating missing add-tags on demand."""
+    add_tags = list(add_tags or [])
+    remove_tags = list(remove_tags or [])
+    if not add_tags and not remove_tags:
+        return {"added": [], "removed": [], "tags": []}
+
+    row = conn.execute("SELECT id FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if row is None:
+        raise PoolRepositoryError("账号不存在", "account_not_found")
+
+    added: list[str] = []
+    removed: list[str] = []
+    now_str = _utcnow().isoformat() + "Z"
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for name in add_tags:
+            tag_row = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+            if tag_row is None:
+                cursor = conn.execute(
+                    "INSERT INTO tags (name, color, created_at) VALUES (?, ?, ?)",
+                    (name, "#1a1a1a", now_str),
+                )
+                tag_id = int(cursor.lastrowid)
+            else:
+                tag_id = int(tag_row["id"])
+            conn.execute(
+                "INSERT OR IGNORE INTO account_tags (account_id, tag_id) VALUES (?, ?)",
+                (account_id, tag_id),
+            )
+            added.append(name)
+
+        for name in remove_tags:
+            tag_row = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+            if tag_row is None:
+                continue
+            conn.execute(
+                "DELETE FROM account_tags WHERE account_id = ? AND tag_id = ?",
+                (account_id, int(tag_row["id"])),
+            )
+            removed.append(name)
+
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    tags = conn.execute(
+        """
+        SELECT t.id, t.name, t.color
+        FROM tags t
+        JOIN account_tags at ON at.tag_id = t.id
+        WHERE at.account_id = ?
+        ORDER BY t.name ASC
+        """,
+        (account_id,),
+    ).fetchall()
+
+    return {
+        "added": added,
+        "removed": removed,
+        "tags": [dict(row) for row in tags],
+    }
+
+
 def get_claim_context(
     conn: sqlite3.Connection,
     claim_token: str,

@@ -1148,6 +1148,11 @@ def api_external_capabilities() -> Any:
         "verification_code",
         "verification_link",
         "wait_message",
+        "pool_claim",
+        "pool_stats",
+        "pool_inventory",
+        "pool_tag_filter",
+        "pool_tag_mutation",
     ]
     if public_mode:
         if settings_repo.get_external_api_disable_raw_content():
@@ -1161,6 +1166,16 @@ def api_external_capabilities() -> Any:
         "public_mode": public_mode,
         "features": available,
         "restricted_features": restricted,
+        "pool": {
+            "external_enabled": settings_repo.get_pool_external_enabled(),
+            "supports_claim": True,
+            "supports_stats": True,
+            "supports_inventory": True,
+            "supports_tags": True,
+            "supports_tag_claim_filter": True,
+            "supports_tag_mutation_on_complete": True,
+            "inventory_endpoint": "/api/external/pool/accounts",
+        },
     }
     external_api_service.audit_external_api_access(
         action="external_api_access",

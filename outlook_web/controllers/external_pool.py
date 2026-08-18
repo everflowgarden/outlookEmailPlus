@@ -13,6 +13,7 @@ from outlook_web.services.pool import (
     claim_random,
     complete_claim,
     get_pool_stats,
+    list_pool_accounts,
     release_claim,
 )
 
@@ -82,6 +83,23 @@ def _check_pool_access(endpoint: str):
     )
 
 
+def _parse_list_values(*values: Any) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        raw_values = value if isinstance(value, list) else [value]
+        for raw in raw_values:
+            for part in str(raw or "").split(","):
+                normalized = part.strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                result.append(normalized)
+    return result
+
+
 def _claim_pool_account(endpoint: str, *, require_email_domain: bool = False):
     disabled_resp = _check_pool_external_enabled(endpoint)
     if disabled_resp is not None:
@@ -95,6 +113,7 @@ def _claim_pool_account(endpoint: str, *, require_email_domain: bool = False):
     provider = body.get("provider")
     project_key = body.get("project_key")
     email_domain = body.get("email_domain")
+    tags = _parse_list_values(body.get("tags"), body.get("include_tags"))
 
     if require_email_domain and not str(email_domain or "").strip():
         _audit(endpoint, "error", details={"code": "EMAIL_DOMAIN_REQUIRED"})
@@ -107,6 +126,7 @@ def _claim_pool_account(endpoint: str, *, require_email_domain: bool = False):
             provider=provider,
             project_key=project_key,
             email_domain=email_domain,
+            tags=tags,
         )
         data = {
             "account_id": account["id"],
@@ -123,6 +143,7 @@ def _claim_pool_account(endpoint: str, *, require_email_domain: bool = False):
                 "provider": provider or "",
                 "project_key": project_key or "",
                 "email_domain": email_domain or "",
+                "tags": tags,
                 "account_id": data["account_id"],
             },
         )
@@ -214,6 +235,8 @@ def api_external_pool_claim_complete():
     task_id = body.get("task_id", "")
     result = body.get("result", "")
     detail = body.get("detail")
+    add_tags = _parse_list_values(body.get("add_tags"))
+    remove_tags = _parse_list_values(body.get("remove_tags"))
 
     if account_id is None:
         _audit(endpoint, "error", details={"code": "ACCOUNT_ID_MISSING"})
@@ -232,6 +255,8 @@ def api_external_pool_claim_complete():
             task_id=task_id,
             result=result,
             detail=detail,
+            add_tags=add_tags,
+            remove_tags=remove_tags,
         )
         _audit(
             endpoint,
@@ -240,9 +265,22 @@ def api_external_pool_claim_complete():
                 "account_id": account_id,
                 "result": result,
                 "pool_status": new_status,
+                "add_tags": add_tags,
+                "remove_tags": remove_tags,
             },
         )
-        return jsonify(external_api_service.ok({"account_id": account_id, "pool_status": new_status}))
+        return jsonify(
+            external_api_service.ok(
+                {
+                    "account_id": account_id,
+                    "pool_status": new_status,
+                    "tag_mutation": {
+                        "add_tags": add_tags,
+                        "remove_tags": remove_tags,
+                    },
+                }
+            )
+        )
     except PoolServiceError as exc:
         return _error_response(endpoint, exc)
     except Exception as exc:
@@ -268,6 +306,46 @@ def api_external_pool_stats():
         stats = get_pool_stats()
         _audit(endpoint, "ok", details={"snapshot": True})
         return jsonify(external_api_service.ok(stats))
+    except Exception as exc:
+        _audit(
+            endpoint,
+            "error",
+            details={"code": "INTERNAL_ERROR", "err": type(exc).__name__},
+        )
+        return jsonify(external_api_service.fail("INTERNAL_ERROR", "服务内部错误")), 500
+
+
+@api_key_required
+@external_api_guards(feature="pool_stats")
+def api_external_pool_accounts():
+    endpoint = "/api/external/pool/accounts"
+    disabled_resp = _check_pool_external_enabled(endpoint)
+    if disabled_resp is not None:
+        return disabled_resp
+    access_resp = _check_pool_access(endpoint)
+    if access_resp is not None:
+        return access_resp
+
+    try:
+        inventory = list_pool_accounts(
+            provider=request.args.get("provider"),
+            pool_status=request.args.get("pool_status"),
+            include_tags=_parse_list_values(request.args.getlist("include_tags"), request.args.get("include_tags")),
+            exclude_tags=_parse_list_values(request.args.getlist("exclude_tags"), request.args.get("exclude_tags")),
+            email_domain=request.args.get("email_domain"),
+            limit=request.args.get("limit", 100),
+        )
+        _audit(
+            endpoint,
+            "ok",
+            details={
+                "total": inventory.get("total", 0),
+                "returned": len(inventory.get("accounts") or []),
+            },
+        )
+        return jsonify(external_api_service.ok(inventory))
+    except PoolServiceError as exc:
+        return _error_response(endpoint, exc)
     except Exception as exc:
         _audit(
             endpoint,

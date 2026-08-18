@@ -9,6 +9,7 @@ This document describes the `/api/external/*` endpoints currently implemented an
 Service goals:
 
 - mailbox pool claim, release, and completion callbacks
+- mailbox pool inventory and tag-aware operations
 - verification-code, verification-link, message-reading, and wait-for-message capabilities
 - service health, capability discovery, and account readability checks
 
@@ -109,6 +110,7 @@ Time fields use ISO 8601, for example:
 | `POST /api/external/pool/claim-release` | release a mailbox | Common |
 | `POST /api/external/pool/claim-complete` | submit the task result | Common |
 | `GET /api/external/pool/stats` | inspect pool counts | Optional |
+| `GET /api/external/pool/accounts` | inspect safe pool inventory with tag filters | Optional |
 
 ---
 
@@ -121,6 +123,44 @@ Time fields use ISO 8601, for example:
 5. call `verification-code` / `verification-link` / `wait-message`
 6. call `claim-complete` on success
 7. call `claim-release` if the task is abandoned
+
+---
+
+## Mail Pool Tag Extensions
+
+`POST /api/external/pool/claim-random` and `claim-domain` accept optional
+`tags` or `include_tags`. All listed tags must exist on the account. When tag
+filters are present, the service will not fall back to tag-less temporary
+mailboxes.
+
+```json
+{
+  "caller_id": "worker-001",
+  "task_id": "job-001",
+  "provider": "outlook",
+  "tags": ["fresh", "openai-ready"]
+}
+```
+
+`POST /api/external/pool/claim-complete` accepts optional `add_tags` and
+`remove_tags`. Tag mutation is only allowed together with a valid claim
+ownership check.
+
+```json
+{
+  "account_id": 123,
+  "claim_token": "clm_xxx",
+  "caller_id": "worker-001",
+  "task_id": "job-001",
+  "result": "success",
+  "add_tags": ["used:openai"],
+  "remove_tags": ["fresh"]
+}
+```
+
+`GET /api/external/pool/accounts` lists safe inventory fields and supports
+`provider`, `pool_status`, `email_domain`, `include_tags`, `exclude_tags`, and
+`limit`.
 
 ---
 
@@ -157,6 +197,7 @@ Response fields:
 - `public_mode`
 - `features`
 - `restricted_features`
+- `pool`
 
 The current `features` list focuses on mail-reading capabilities:
 
@@ -166,6 +207,14 @@ The current `features` list focuses on mail-reading capabilities:
 - `verification_code`
 - `verification_link`
 - `wait_message`
+- `pool_claim`
+- `pool_stats`
+- `pool_inventory`
+- `pool_tag_filter`
+- `pool_tag_mutation`
+
+The `pool` object reports whether external pool, inventory, tag filtering, and
+tag mutation on completion are supported.
 
 ### `GET /api/external/account-status`
 

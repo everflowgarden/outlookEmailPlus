@@ -284,8 +284,27 @@ class ExternalPoolApiTests(unittest.TestCase):
                 "api_external_pool_claim_release",
                 "api_external_pool_claim_complete",
                 "api_external_pool_stats",
+                "api_external_pool_accounts",
             },
         )
+
+    def _add_tag_to_account(self, account_id: int, tag_name: str) -> int:
+        with self.app.app_context():
+            from outlook_web.db import get_db
+
+            db = get_db()
+            row = db.execute("SELECT id FROM tags WHERE name = ?", (tag_name,)).fetchone()
+            if row is None:
+                cursor = db.execute("INSERT INTO tags (name, color) VALUES (?, ?)", (tag_name, "#1a1a1a"))
+                tag_id = int(cursor.lastrowid)
+            else:
+                tag_id = int(row["id"])
+            db.execute(
+                "INSERT OR IGNORE INTO account_tags (account_id, tag_id) VALUES (?, ?)",
+                (account_id, tag_id),
+            )
+            db.commit()
+            return tag_id
 
     def test_external_pool_claim_release_caller_mismatch(self):
         client = self.app.test_client()
@@ -363,6 +382,115 @@ class ExternalPoolApiTests(unittest.TestCase):
         self.assertTrue(data.get("success"))
         self.assertEqual(data.get("code"), "OK")
         self.assertEqual(data.get("data", {}).get("pool_status"), "used")
+
+    def test_external_pool_accounts_filters_include_and_exclude_tags(self):
+        client = self.app.test_client()
+        self._set_external_api_key("abc123")
+        with self.app.app_context():
+            from outlook_web.repositories import settings as settings_repo
+
+            settings_repo.set_setting("pool_external_enabled", "true")
+        wanted = self._insert_pool_account(provider="outlook")
+        blocked = self._insert_pool_account(provider="outlook")
+        include_tag = f"openai-unused-{uuid.uuid4().hex}"
+        exclude_tag = f"used-openai-{uuid.uuid4().hex}"
+        self._add_tag_to_account(wanted, include_tag)
+        self._add_tag_to_account(blocked, exclude_tag)
+
+        include_resp = client.get(
+            f"/api/external/pool/accounts?include_tags={include_tag}",
+            headers=self._auth_headers(),
+        )
+        exclude_resp = client.get(
+            f"/api/external/pool/accounts?exclude_tags={exclude_tag}",
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(include_resp.status_code, 200)
+        include_accounts = include_resp.get_json()["data"]["accounts"]
+        self.assertEqual([item["account_id"] if "account_id" in item else item["id"] for item in include_accounts], [wanted])
+        self.assertEqual(include_accounts[0]["tags"][0]["name"], include_tag)
+
+        self.assertEqual(exclude_resp.status_code, 200)
+        excluded_ids = {item.get("account_id", item.get("id")) for item in exclude_resp.get_json()["data"]["accounts"]}
+        self.assertIn(wanted, excluded_ids)
+        self.assertNotIn(blocked, excluded_ids)
+
+    def test_external_pool_claim_random_can_filter_by_tag(self):
+        client = self.app.test_client()
+        self._set_external_api_key("abc123")
+        with self.app.app_context():
+            from outlook_web.repositories import settings as settings_repo
+
+            settings_repo.set_setting("pool_external_enabled", "true")
+        untagged = self._insert_pool_account(provider="outlook")
+        tagged = self._insert_pool_account(provider="outlook")
+        tag_name = f"flow-ready-{uuid.uuid4().hex}"
+        self._add_tag_to_account(tagged, tag_name)
+
+        resp = client.post(
+            "/api/external/pool/claim-random",
+            headers=self._auth_headers(),
+            json={
+                "caller_id": "ext-worker-01",
+                "task_id": "tag-claim",
+                "provider": "outlook",
+                "tags": [tag_name],
+            },
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data.get("success"))
+        self.assertEqual(data.get("data", {}).get("account_id"), tagged)
+        self.assertNotEqual(data.get("data", {}).get("account_id"), untagged)
+
+    def test_external_pool_claim_complete_can_mutate_tags(self):
+        client = self.app.test_client()
+        self._set_external_api_key("abc123")
+        with self.app.app_context():
+            from outlook_web.repositories import settings as settings_repo
+
+            settings_repo.set_setting("pool_external_enabled", "true")
+        account_id = self._insert_pool_account(provider="outlook")
+        fresh_tag = f"fresh-{uuid.uuid4().hex}"
+        used_tag = f"used-openai-{uuid.uuid4().hex}"
+        self._add_tag_to_account(account_id, fresh_tag)
+
+        claim_resp = client.post(
+            "/api/external/pool/claim-random",
+            headers=self._auth_headers(),
+            json={"caller_id": "ext-worker-01", "task_id": "tag-complete", "provider": "outlook"},
+        )
+        self.assertEqual(claim_resp.status_code, 200)
+        claim_data = claim_resp.get_json()["data"]
+
+        complete_resp = client.post(
+            "/api/external/pool/claim-complete",
+            headers=self._auth_headers(),
+            json={
+                "account_id": claim_data["account_id"],
+                "claim_token": claim_data["claim_token"],
+                "caller_id": "ext-worker-01",
+                "task_id": "tag-complete",
+                "result": "success",
+                "add_tags": [used_tag],
+                "remove_tags": [fresh_tag],
+            },
+        )
+        self.assertEqual(complete_resp.status_code, 200)
+
+        inventory_resp = client.get(
+            f"/api/external/pool/accounts?include_tags={used_tag}",
+            headers=self._auth_headers(),
+        )
+        self.assertEqual(inventory_resp.status_code, 200)
+        accounts = inventory_resp.get_json()["data"]["accounts"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0].get("id"), account_id)
+        tag_names = {tag["name"] for tag in accounts[0]["tags"]}
+        self.assertIn(used_tag, tag_names)
+        self.assertNotIn(fresh_tag, tag_names)
 
     def test_external_pool_stats_success(self):
         client = self.app.test_client()

@@ -25,6 +25,7 @@ PROJECT_KEY_MAX_LEN = 128
 EMAIL_DOMAIN_MAX_LEN = 128
 REASON_MAX_LEN = 256
 DETAIL_MAX_LEN = 512
+TAG_NAME_MAX_LEN = 50
 
 VALID_RESULTS = set(pool_repo.RESULT_TO_POOL_STATUS.keys())
 
@@ -112,6 +113,26 @@ def _validate_email_domain(email_domain: Optional[str]) -> Optional[str]:
     return d
 
 
+def _validate_tag_names(values: Optional[list[str]], *, field: str = "tags") -> list[str]:
+    if not values:
+        return []
+    if not isinstance(values, list):
+        raise PoolServiceError(f"{field} 必须是字符串数组", "invalid_tags")
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        if len(name) > TAG_NAME_MAX_LEN:
+            raise PoolServiceError(f"{field} 包含超过最大长度 {TAG_NAME_MAX_LEN} 的标签", "tag_too_long")
+        if name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    return result
+
+
 def _read_settings_via_conn(conn) -> dict:
     """在独立连接场景下直接从 settings 表读取池相关配置。"""
     rows = conn.execute(
@@ -156,12 +177,14 @@ def claim_random(
     provider: Optional[str] = None,
     project_key: Optional[str] = None,
     email_domain: Optional[str] = None,
+    tags: Optional[list[str]] = None,
 ) -> dict:
     _validate_caller_id(caller_id)
     _validate_task_id(task_id)
     provider = _validate_provider(provider)
     project_key = _validate_project_key(project_key)
     email_domain = _validate_email_domain(email_domain)
+    tags = _validate_tag_names(tags)
 
     conn = create_sqlite_connection()
     try:
@@ -178,6 +201,7 @@ def claim_random(
                 provider=provider,
                 project_key=project_key,
                 email_domain=email_domain,
+                tags=tags,
             )
         except pool_repo.PoolRepositoryError as e:
             # 将 Repository 层异常转换为 Service 层异常
@@ -186,8 +210,9 @@ def claim_random(
         if account is not None:
             return account
 
-        # accounts 池无命中：对临时邮箱类 provider（custom/gptmail/未指定）回退到 temp_emails 池领取
-        if provider in _TEMP_ELIGIBLE_PROVIDERS:
+        # accounts 池无命中：对临时邮箱类 provider（custom/gptmail/未指定）回退到 temp_emails 池领取。
+        # 带 tags 过滤时不能回退，因为 temp_emails 当前没有标签模型。
+        if not tags and provider in _TEMP_ELIGIBLE_PROVIDERS:
             try:
                 temp_account = pool_repo.claim_temp_mailbox_atomic(
                     conn,
@@ -200,6 +225,9 @@ def claim_random(
                 raise PoolServiceError(str(e), e.error_code, http_status=500) from e
             if temp_account is not None:
                 return temp_account
+
+        if tags:
+            raise PoolServiceError("池中没有符合标签条件的可用邮箱", "no_available_account", http_status=200)
 
         # 池为空：仅当显式指定 provider=cloudflare_temp_mail 时，动态创建 CF 临时邮箱
         if provider == "cloudflare_temp_mail":
@@ -312,6 +340,8 @@ def complete_claim(
     task_id: str,
     result: str,
     detail: Optional[str] = None,
+    add_tags: Optional[list[str]] = None,
+    remove_tags: Optional[list[str]] = None,
 ) -> str:
     """
     标记领取结果并驱动状态机流转。
@@ -329,6 +359,8 @@ def complete_claim(
         )
     if detail and len(detail) > DETAIL_MAX_LEN:
         raise PoolServiceError(f"detail 超过最大长度 {DETAIL_MAX_LEN}", "detail_too_long")
+    add_tags = _validate_tag_names(add_tags, field="add_tags")
+    remove_tags = _validate_tag_names(remove_tags, field="remove_tags")
 
     conn = create_sqlite_connection()
     try:
@@ -380,6 +412,17 @@ def complete_claim(
             claimed_project_key=claimed_project_key,
             enable_project_reuse=enable_project_reuse,
         )
+
+        if add_tags or remove_tags:
+            try:
+                pool_repo.update_account_tags_by_name(
+                    conn,
+                    account_id,
+                    add_tags=add_tags,
+                    remove_tags=remove_tags,
+                )
+            except pool_repo.PoolRepositoryError as e:
+                raise PoolServiceError(str(e), e.error_code, http_status=500) from e
 
         if (row["provider"] or "").strip() == "cloudflare_temp_mail" and result in CF_DELETE_ON_RESULTS:
             meta_str = row["temp_mail_meta"]
@@ -494,5 +537,43 @@ def get_pool_stats() -> dict:
     conn = create_sqlite_connection()
     try:
         return pool_repo.get_stats(conn)
+    finally:
+        conn.close()
+
+
+def list_pool_accounts(
+    *,
+    provider: Optional[str] = None,
+    pool_status: Optional[str] = None,
+    include_tags: Optional[list[str]] = None,
+    exclude_tags: Optional[list[str]] = None,
+    email_domain: Optional[str] = None,
+    limit: int = 100,
+) -> dict:
+    """Return external-safe pool account inventory with tag filters."""
+    provider = _validate_provider(provider)
+    email_domain = _validate_email_domain(email_domain)
+    include_tags = _validate_tag_names(include_tags, field="include_tags")
+    exclude_tags = _validate_tag_names(exclude_tags, field="exclude_tags")
+    normalized_pool_status = str(pool_status or "").strip().lower()
+    valid_pool_statuses = set(pool_repo.RESULT_TO_POOL_STATUS.values()) | {"available", "claimed"}
+    if normalized_pool_status and normalized_pool_status not in valid_pool_statuses:
+        raise PoolServiceError("pool_status 无效", "invalid_pool_status")
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        raise PoolServiceError("limit 必须为整数", "invalid_limit")
+
+    conn = create_sqlite_connection()
+    try:
+        return pool_repo.list_accounts_inventory(
+            conn,
+            provider=provider,
+            pool_status=normalized_pool_status or None,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            email_domain=email_domain,
+            limit=normalized_limit,
+        )
     finally:
         conn.close()

@@ -30,9 +30,9 @@ ENV PYTHONUNBUFFERED=1 \
     SPA_ENABLED=true
 
 COPY requirements.txt .
-RUN pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip install gunicorn -i https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt && \
+    pip install gunicorn
 
 COPY . .
 COPY --from=frontend /frontend/dist /app/ant-design-pro/dist
